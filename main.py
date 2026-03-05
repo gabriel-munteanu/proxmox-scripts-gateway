@@ -8,12 +8,12 @@ import os
 import subprocess
 import re
 import fcntl
-import time
+import asyncio
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI(title="Proxmox VE API")
 
@@ -92,6 +92,14 @@ class AppConfig(BaseModel):
     bridge: str = "vmbr0"
     # App-specific options (parsed from script)
     options: dict = Field(default_factory=dict)
+
+    @field_validator('options')
+    @classmethod
+    def validate_options(cls, v: dict) -> dict:
+        """Validate and sanitize user-provided options"""
+        allowed_keys = {"vmid", "ip", "ip_base", "template", "ssh_key", "password"}
+        # Filter to only allowed keys
+        return {k: val for k, val in v.items() if k.lower() in allowed_keys}
 
 
 class InstallResult(BaseModel):
@@ -233,7 +241,7 @@ def scan_apps() -> list:
 @app.get("/apps")
 async def list_apps(token: str = Depends(verify_token)):
     """Get list of available applications"""
-    apps = scan_apps()
+    apps = await asyncio.to_thread(scan_apps)
     return {
         "count": len(apps),
         "apps": [
@@ -261,14 +269,14 @@ async def refresh_apps_cache():
 @app.get("/apps/{app_name}")
 async def get_app_details(app_name: str, token: str = Depends(verify_token)):
     """Get detailed configuration options for an app"""
-    apps = scan_apps()
+    apps = await asyncio.to_thread(scan_apps)
 
     app = next((a for a in apps if a["name"].lower() == app_name.lower()), None)
     if not app:
         raise HTTPException(status_code=404, detail=f"App '{app_name}' not found")
 
     # Calculate next VMID and IP
-    next_vmid = get_next_vmid()
+    next_vmid = await asyncio.to_thread(get_next_vmid)
     next_ip = calculate_ip(next_vmid)
 
     return {
@@ -298,21 +306,32 @@ async def install_app(config: AppConfig, token: str = Depends(verify_token)) -> 
 
 async def _do_install(config: AppConfig) -> InstallResult:
     """Internal installation logic (called after lock acquired)"""
-    apps = scan_apps()
+    apps = await asyncio.to_thread(scan_apps)
 
     app = next((a for a in apps if a["name"].lower() == config.app_name.lower()), None)
     if not app:
         raise HTTPException(status_code=404, detail=f"App '{config.app_name}' not found")
 
-    # Get VMID (use provided or get next)
-    vmid = config.options.get("vmid", get_next_vmid())
+    # Get VMID (use provided or get next), with validation
+    raw_vmid = config.options.get("vmid")
+    if raw_vmid is not None:
+        try:
+            vmid = int(raw_vmid)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid 'vmid' option: must be an integer")
+    else:
+        vmid = await asyncio.to_thread(get_next_vmid)
 
     # Calculate IP if not provided
     if "ip" not in config.options:
         ip_base = config.options.get("ip_base", "192.168.1")
+        if not isinstance(ip_base, str):
+            raise HTTPException(status_code=400, detail="Invalid 'ip_base' option: must be a string")
         ip = calculate_ip(vmid, ip_base)
     else:
         ip = config.options["ip"]
+        if not isinstance(ip, str):
+            raise HTTPException(status_code=400, detail="Invalid 'ip' option: must be a string")
 
     # Build environment variables for script
     env = os.environ.copy()
@@ -333,8 +352,9 @@ async def _do_install(config: AppConfig) -> InstallResult:
             env[f"CT_{key.upper()}"] = str(value)
 
     try:
-        # Execute the script
-        result = subprocess.run(
+        # Execute the script in thread to avoid blocking event loop
+        result = await asyncio.to_thread(
+            subprocess.run,
             ["bash", app["script_path"]],
             env=env,
             capture_output=True,
@@ -359,12 +379,6 @@ async def _do_install(config: AppConfig) -> InstallResult:
         return InstallResult(success=False, message="Installation timed out")
     except Exception as e:
         return InstallResult(success=False, message=str(e))
-
-
-def extract_ip(output: str) -> Optional[str]:
-    """Extract IP address from script output"""
-    match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', output)
-    return match.group(0) if match else None
 
 
 if __name__ == "__main__":
