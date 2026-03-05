@@ -159,11 +159,17 @@ def scan_apps() -> list:
 
     apps = []
 
-    # Try to find scripts directory
+    # Handle scripts directory
     if not SCRIPTS_DIR.exists():
         # Clone if not exists
         subprocess.run(
             ["git", "clone", "https://github.com/community-scripts/ProxmoxVE.git", str(SCRIPTS_DIR)],
+            capture_output=True
+        )
+    else:
+        # Pull if exists
+        subprocess.run(
+            ["git", "-C", str(SCRIPTS_DIR), "pull"],
             capture_output=True
         )
 
