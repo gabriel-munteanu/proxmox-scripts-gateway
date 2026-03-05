@@ -7,6 +7,8 @@ Auto-install applications from Proxmox VE Helper-Scripts
 import os
 import subprocess
 import re
+import fcntl
+import time
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends
@@ -37,6 +39,48 @@ SCRIPTS_DIR = Path("/opt/pve-helper-scripts")
 
 # Cache for parsed scripts
 APPS_CACHE = None
+
+# Lock file for installation
+LOCK_FILE = Path("/tmp/proxmox-api-install.lock")
+
+
+class InstallLock:
+    """Context manager for installation lock"""
+
+    def __init__(self):
+        self.lock_file = None
+
+    def __enter__(self):
+        self.lock_file = open(LOCK_FILE, 'w')
+        try:
+            fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError:
+            self.lock_file.close()
+            raise HTTPException(
+                status_code=409,
+                detail="Installation already in progress. Please wait."
+            )
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.lock_file:
+            fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+            self.lock_file.close()
+
+
+@app.get("/install/status")
+async def install_status(token: str = Depends(verify_token)):
+    """Check if an installation is in progress"""
+    if LOCK_FILE.exists():
+        # Try to acquire lock - if we can, no installation is running
+        try:
+            with open(LOCK_FILE, 'w') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            return {"in_progress": False}
+        except IOError:
+            return {"in_progress": True}
+    return {"in_progress": False}
 
 
 class AppConfig(BaseModel):
@@ -247,6 +291,13 @@ async def get_app_details(app_name: str, token: str = Depends(verify_token)):
 @app.post("/install")
 async def install_app(config: AppConfig, token: str = Depends(verify_token)) -> InstallResult:
     """Install an application with given configuration"""
+    # Acquire lock to prevent concurrent installations
+    with InstallLock():
+        return _do_install(config)
+
+
+async def _do_install(config: AppConfig) -> InstallResult:
+    """Internal installation logic (called after lock acquired)"""
     apps = scan_apps()
 
     app = next((a for a in apps if a["name"].lower() == config.app_name.lower()), None)
