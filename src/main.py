@@ -55,6 +55,12 @@ def get_timestamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def sanitize_name(name: str) -> str:
+    """Replace spaces and special characters with underscores for safe filenames"""
+    # Replace spaces and common special chars with underscore
+    return re.sub(r'[^\w\-.]', '_', name)
+
+
 class InstallLock:
     """Context manager for installation lock"""
 
@@ -201,8 +207,14 @@ def calculate_ip(vmid: int, base_subnet: str = "192.168.1") -> str:
     return f"{base_subnet}.{last_octet}"
 
 
-def parse_script(script_path: Path) -> dict:
-    """Parse a helper script to extract configuration options"""
+def parse_script(script_path: Path, script_type: str = "ct") -> dict:
+    """
+    Parse a helper script to extract configuration options
+    
+    Args:
+        script_path: Path to the script file
+        script_type: Type of script - "ct" for containers, "vm" for virtual machines
+    """
     content = script_path.read_text()
 
     # Extract variables and their defaults
@@ -222,21 +234,37 @@ def parse_script(script_path: Path) -> dict:
     desc_match = re.search(r'#\s*(Description|Desc):\s*(.+)', content, re.IGNORECASE)
     description = desc_match.group(2) if desc_match else "No description"
 
+    # Sanitize name for safe filenames
+    sanitized_name = sanitize_name(script_path.stem)
+
     return {
         "name": script_path.stem,
+        "sanitized_name": sanitized_name,
         "description": description,
         "template": template,
         "variables": variables,
-        "script_path": str(script_path)
+        "script_path": str(script_path),
+        "type": script_type  # "ct" or "vm"
     }
 
 
-def scan_apps() -> list:
-    """Scan scripts directory and parse all apps"""
+def scan_apps(script_type: str = "ct") -> list:
+    """
+    Scan scripts directory and parse all apps
+    
+    Args:
+        script_type: Filter by type - "ct" for containers (default), "vm" for virtual machines, "all" for both
+    
+    Returns:
+        List of parsed app dictionaries
+    """
     global APPS_CACHE
 
+    # Note: Cache stores ALL apps, filtering happens at return
     if APPS_CACHE is not None:
-        return APPS_CACHE
+        if script_type == "all":
+            return APPS_CACHE
+        return [app for app in APPS_CACHE if app.get("type") == script_type]
 
     apps = []
 
@@ -261,30 +289,52 @@ def scan_apps() -> list:
         if result.returncode != 0:
             print(f"Git pull failed: {result.stderr}")
 
+    # Scan CT (container) scripts
     ct_scripts = SCRIPTS_DIR / "ct"
     if ct_scripts.exists():
         for script in ct_scripts.glob("*.sh"):
             try:
-                app_info = parse_script(script)
+                app_info = parse_script(script, script_type="ct")
+                apps.append(app_info)
+            except Exception as e:
+                print(f"Failed to parse {script}: {e}")
+
+    # Scan VM scripts (for future use - not enabled by default)
+    vm_scripts = SCRIPTS_DIR / "vm"
+    if vm_scripts.exists():
+        for script in vm_scripts.glob("*.sh"):
+            try:
+                app_info = parse_script(script, script_type="vm")
                 apps.append(app_info)
             except Exception as e:
                 print(f"Failed to parse {script}: {e}")
 
     APPS_CACHE = apps
-    return apps
+    
+    # Apply filtering
+    if script_type == "all":
+        return apps
+    return [app for app in apps if app.get("type") == script_type]
 
 
 @app.get("/apps")
-async def list_apps(token: str = Depends(verify_token)):
-    """Get list of available applications"""
-    apps = await asyncio.to_thread(scan_apps)
+async def list_apps(token: str = Depends(verify_token), type: str = "ct"):
+    """
+    Get list of available applications
+    
+    Args:
+        type: Filter by script type - "ct" (containers, default), "vm" (virtual machines), "all" (both)
+    """
+    apps = await asyncio.to_thread(scan_apps, script_type=type)
     return {
         "count": len(apps),
         "apps": [
             {
                 "name": a["name"],
+                "sanitized_name": a.get("sanitized_name", a["name"]),
                 "description": a["description"],
-                "template": a["template"]
+                "template": a["template"],
+                "type": a.get("type", "ct")
             }
             for a in apps
         ]
@@ -349,9 +399,17 @@ async def _do_install(config: AppConfig) -> InstallResult:
     """Internal installation logic (called after lock acquired)"""
     apps = await asyncio.to_thread(scan_apps)
 
+    # Get app info - use sanitized name for log file
     app = next((a for a in apps if a["name"].lower() == config.app_name.lower()), None)
     if not app:
         raise HTTPException(status_code=404, detail=f"App '{config.app_name}' not found")
+
+    # Check script type (currently only CT is supported)
+    if app.get("type") != "ct":
+        raise HTTPException(
+            status_code=400,
+            detail=f"App '{config.app_name}' is a {app.get('type').upper()} script. Only CT (container) scripts are supported currently."
+        )
 
     # Get VMID (use provided or get next), with validation
     raw_vmid = config.options.get("vmid")
@@ -375,8 +433,10 @@ async def _do_install(config: AppConfig) -> InstallResult:
             raise HTTPException(status_code=400, detail="Invalid 'ip' option: must be a string")
 
     # Generate log file path: {timestamp}_{app}_ct{vmid}.log
+    # Use sanitized name to handle spaces/special characters in app names
     timestamp = get_timestamp()
-    log_filename = f"{timestamp}_{config.app_name}_ct{vmid}.log"
+    app_name_for_file = app.get("sanitized_name", config.app_name)
+    log_filename = f"{timestamp}_{app_name_for_file}_ct{vmid}.log"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / log_filename
 
@@ -398,6 +458,16 @@ async def _do_install(config: AppConfig) -> InstallResult:
         if key.lower() in allowed_keys:
             env[f"CT_{key.upper()}"] = str(value)
 
+    # Build custom fields string for config header (exclude basic fields already listed)
+    custom_fields = []
+    for key, value in config.options.items():
+        if key.lower() not in ("vmid", "ip", "ip_base", "bridge"):  # Skip already-listed fields
+            custom_fields.append(f"# {key.upper()}: {value}")
+
+    custom_fields_str = "\n".join(custom_fields)
+    if custom_fields_str:
+        custom_fields_str = "\n" + custom_fields_str
+
     # Write configuration header to log file
     config_header = f"""# Installation Configuration
 # Timestamp: {timestamp}
@@ -410,6 +480,7 @@ async def _do_install(config: AppConfig) -> InstallResult:
 # IP: {ip}/24
 # Gateway: 192.168.1.1
 # DNS: 192.168.1.201
+{custom_fields_str}
 
 """
     log_file.write_text(config_header)
