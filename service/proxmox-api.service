@@ -1,0 +1,37 @@
+[Unit]
+Description=Proxmox Scripts API
+After=network.target
+
+[Service]
+Type=notify
+User=root
+WorkingDirectory=/opt/proxmox-scripts-gateway
+# === ENVIRONMENT VARIABLES ===
+# Required: API token for authentication (CHANGE THIS!)
+# Generate a secure token: python3 -c "import secrets; print(secrets.token_hex(32))"
+Environment="PROXMOX_API_TOKEN=YOUR_SECURE_TOKEN_HERE"
+
+# Optional: Path to Proxmox VE Helper-Scripts repository
+# Default: /opt/pve-helper-scripts
+Environment="SCRIPTS_DIR=/opt/pve-helper-scripts"
+
+# Optional: API host and port
+Environment="API_HOST=0.0.0.0"
+Environment="API_PORT=8000"
+
+# Optional: Log level (DEBUG, INFO, WARNING, ERROR)
+Environment="LOG_LEVEL=INFO"
+
+# === END ENVIRONMENT VARIABLES ===
+ExecStart=/usr/bin/python3 /opt/proxmox-scripts-gateway/src/main.py
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/tmp/proxmox-api-install.lock
+
+[Install]
+WantedBy=multi-user.target
