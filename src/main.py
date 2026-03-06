@@ -107,6 +107,7 @@ class AppConfig(BaseModel):
     ram_mb: int = Field(default=512, ge=256, le=131072, description="RAM in MB")
     disk_gb: int = Field(default=4, ge=1, le=1024, description="Disk size in GB")
     bridge: str = "vmbr0"
+    vmid: Optional[int] = Field(default=None, description="Container ID (optional, auto-assigned if not provided)")
     # App-specific options (parsed from script)
     options: dict = Field(default_factory=dict)
 
@@ -151,16 +152,21 @@ class InstallResult(BaseModel):
 
 def get_next_vmid() -> int:
     """Get next available VMID (container)"""
-    # Check existing containers
-    result = subprocess.run(
-        ["pct", "list"],
-        capture_output=True,
-        text=True
-    )
+    # Check if pct command exists (Proxmox only)
+    try:
+        result = subprocess.run(
+            ["pct", "list"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+    except FileNotFoundError:
+        # Not running on Proxmox - use default
+        return 100
 
     if result.returncode != 0:
-        error_msg = result.stderr.strip() or "Unknown error"
-        raise RuntimeError(f"'pct list' failed with exit code {result.returncode}: {error_msg}")
+        # If pct fails, use default
+        return 100
 
     ids = []
     for line in result.stdout.splitlines()[1:]:  # Skip header
@@ -170,40 +176,32 @@ def get_next_vmid() -> int:
                 ids.append(int(parts[0]))
 
     # Also check VMs
-    result = subprocess.run(
-        ["qm", "list"],
-        capture_output=True,
-        text=True
-    )
-
-    if result.returncode != 0:
-        error_msg = result.stderr.strip() or "Unknown error"
-        raise RuntimeError(f"'qm list' failed with exit code {result.returncode}: {error_msg}")
-
-    for line in result.stdout.splitlines()[1:]:
-        if line.strip():
-            parts = line.split()
-            if parts[0].isdigit():
-                ids.append(int(parts[0]))
+    try:
+        result = subprocess.run(
+            ["qm", "list"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines()[1:]:
+                if line.strip():
+                    parts = line.split()
+                    if parts[0].isdigit():
+                        ids.append(int(parts[0]))
+    except FileNotFoundError:
+        pass  # qm not available
 
     return max(ids, default=99) + 1
 
 
 def calculate_ip(vmid: int, base_subnet: str = "192.168.1") -> str:
     """
-    Calculate an IPv4 address for a VM/CT by appending `vmid + 100` as the last octet to `base_subnet`.
-
-    This function performs a simple arithmetic offset on the last octet only and does not handle
-    overflow beyond 255 or carry into higher octets. Callers must ensure that `vmid + 100` results
-    in a valid last-octet value (1-254) for their chosen `base_subnet`.
+    Calculate an IPv4 address for a VM/CT based on VMID.
+    Uses modulo to ensure the last octet stays in valid range 1-254.
     """
-    last_octet = vmid + 100
-    # Ensure the last octet is within a valid IPv4 host range (1-254)
-    if not 1 <= last_octet <= 254:
-        raise ValueError(
-            f"Cannot calculate IP for vmid {vmid}: resulting last octet {last_octet} "
-            f"is outside the valid range 1-254."
-        )
+    # Use modulo 253 (max hosts) + 1 to get valid octet 1-254
+    last_octet = ((vmid - 100) % 253) + 1 if vmid >= 100 else vmid
     return f"{base_subnet}.{last_octet}"
 
 
@@ -385,19 +383,13 @@ async def get_app_details(app_name: str, token: str = Depends(verify_token)):
 def _run_install_with_lock(config: AppConfig) -> InstallResult:
     """Synchronous installation with lock - runs in thread pool"""
     with InstallLock():
-        return asyncio.run(_do_install(config))
+        # Run sync version of install
+        return _do_install_sync(config)
 
 
-@app.post("/install")
-async def install_app(config: AppConfig, token: str = Depends(verify_token)) -> InstallResult:
-    """Install an application with given configuration"""
-    # Run entire install (including lock) in thread to avoid blocking event loop
-    return await asyncio.to_thread(_run_install_with_lock, config)
-
-
-async def _do_install(config: AppConfig) -> InstallResult:
-    """Internal installation logic (called after lock acquired)"""
-    apps = await asyncio.to_thread(scan_apps)
+def _do_install_sync(config: AppConfig) -> InstallResult:
+    """Synchronous installation logic (no async calls)"""
+    apps = scan_apps()
 
     # Get app info - use sanitized name for log file
     app = next((a for a in apps if a["name"].lower() == config.app_name.lower()), None)
@@ -412,14 +404,14 @@ async def _do_install(config: AppConfig) -> InstallResult:
         )
 
     # Get VMID (use provided or get next), with validation
-    raw_vmid = config.options.get("vmid")
+    raw_vmid = config.vmid if config.vmid is not None else config.options.get("vmid")
     if raw_vmid is not None:
         try:
             vmid = int(raw_vmid)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid 'vmid' option: must be an integer")
     else:
-        vmid = await asyncio.to_thread(get_next_vmid)
+        vmid = get_next_vmid()
 
     # Calculate IP if not provided
     if "ip" not in config.options:
@@ -450,6 +442,8 @@ async def _do_install(config: AppConfig) -> InstallResult:
         "CT_BRIDGE": config.bridge,
         "CT_IP": ip,
         "CT_GW": "192.168.1.1",
+        # Disable terminal UI features (clear, colors) for non-interactive execution
+        "TERM": "dumb",
     })
 
     # Add custom options (only allow specific keys to prevent security issues)
@@ -486,9 +480,145 @@ async def _do_install(config: AppConfig) -> InstallResult:
     log_file.write_text(config_header)
 
     try:
-        # Execute the script in thread to avoid blocking event loop
-        result = await asyncio.to_thread(
-            subprocess.run,
+        # Execute the script
+        result = subprocess.run(
+            ["bash", app["script_path"]],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600
+        )
+
+        # Append output to log file
+        log_output = result.stdout + "\n" + result.stderr
+        with open(log_file, "a") as f:
+            f.write(log_output)
+
+        if result.returncode != 0:
+            return InstallResult(
+                success=False,
+                message=f"Installation failed: {result.stderr}"
+            )
+
+        return InstallResult(
+            success=True,
+            vmid=vmid,
+            ip=f"{ip}/24",
+            message=f"Application '{config.app_name}' installed successfully"
+        )
+
+    except subprocess.TimeoutExpired:
+        with open(log_file, "a") as f:
+            f.write("\n# Installation timed out\n")
+        return InstallResult(success=False, message="Installation timed out")
+    except Exception as e:
+        with open(log_file, "a") as f:
+            f.write(f"\n# Error: {e}\n")
+        return InstallResult(success=False, message=str(e))
+
+
+@app.post("/install")
+async def install_app(config: AppConfig, token: str = Depends(verify_token)) -> InstallResult:
+    """Install an application with given configuration"""
+    # Run entire install (including lock) in thread to avoid blocking event loop
+    return await asyncio.to_thread(_run_install_with_lock, config)
+
+
+async def _do_install(config: AppConfig) -> InstallResult:
+    """Internal installation logic (called after lock acquired)"""
+    apps = scan_apps()
+
+    # Get app info - use sanitized name for log file
+    app = next((a for a in apps if a["name"].lower() == config.app_name.lower()), None)
+    if not app:
+        raise HTTPException(status_code=404, detail=f"App '{config.app_name}' not found")
+
+    # Check script type (currently only CT is supported)
+    if app.get("type") != "ct":
+        raise HTTPException(
+            status_code=400,
+            detail=f"App '{config.app_name}' is a {app.get('type').upper()} script. Only CT (container) scripts are supported currently."
+        )
+
+    # Get VMID (use provided or get next), with validation
+    raw_vmid = config.vmid if config.vmid is not None else config.options.get("vmid")
+    if raw_vmid is not None:
+        try:
+            vmid = int(raw_vmid)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid 'vmid' option: must be an integer")
+    else:
+        vmid = get_next_vmid()
+
+    # Calculate IP if not provided
+    if "ip" not in config.options:
+        ip_base = config.options.get("ip_base", "192.168.1")
+        if not isinstance(ip_base, str):
+            raise HTTPException(status_code=400, detail="Invalid 'ip_base' option: must be a string")
+        ip = calculate_ip(vmid, ip_base)
+    else:
+        ip = config.options["ip"]
+        if not isinstance(ip, str):
+            raise HTTPException(status_code=400, detail="Invalid 'ip' option: must be a string")
+
+    # Generate log file path: {timestamp}_{app}_ct{vmid}.log
+    # Use sanitized name for handle spaces/special characters in app names
+    timestamp = get_timestamp()
+    app_name_for_file = app.get("sanitized_name", config.app_name)
+    log_filename = f"{timestamp}_{app_name_for_file}_ct{vmid}.log"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOG_DIR / log_filename
+
+    # Build environment variables for script
+    env = os.environ.copy()
+    env.update({
+        "CT_ID": str(vmid),
+        "CT_CPU": str(config.cpu),
+        "CT_RAM": str(config.ram_mb),
+        "CT_DISK": str(config.disk_gb * 1000),  # Convert GB to MB (decimal)
+        "CT_BRIDGE": config.bridge,
+        "CT_IP": ip,
+        "CT_GW": "192.168.1.1",
+        # Disable terminal UI features (clear, colors) for non-interactive execution
+        "TERM": "dumb",
+    })
+
+    # Add custom options (only allow specific keys to prevent security issues)
+    allowed_keys = {"vmid", "ip", "ip_base", "template", "ssh_key", "password"}
+    for key, value in config.options.items():
+        if key.lower() in allowed_keys:
+            env[f"CT_{key.upper()}"] = str(value)
+
+    # Build custom fields string for config header (exclude basic fields already listed)
+    custom_fields = []
+    for key, value in config.options.items():
+        if key.lower() not in ("vmid", "ip", "ip_base", "bridge"):  # Skip already-listed fields
+            custom_fields.append(f"# {key.upper()}: {value}")
+
+    custom_fields_str = "\n".join(custom_fields)
+    if custom_fields_str:
+        custom_fields_str = "\n" + custom_fields_str
+
+    # Write configuration header to log file
+    config_header = f"""# Installation Configuration
+# Timestamp: {timestamp}
+# App: {config.app_name}
+# Container: ct{vmid}
+# CPU: {config.cpu}
+# RAM: {config.ram_mb} MB
+# Disk: {config.disk_gb} GB
+# Bridge: {config.bridge}
+# IP: {ip}/24
+# Gateway: 192.168.1.1
+# DNS: 192.168.1.201
+{custom_fields_str}
+
+"""
+    log_file.write_text(config_header)
+
+    try:
+        # Execute the script
+        result = subprocess.run(
             ["bash", app["script_path"]],
             env=env,
             capture_output=True,
