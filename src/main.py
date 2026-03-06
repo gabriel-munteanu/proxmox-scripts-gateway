@@ -12,6 +12,7 @@ import asyncio
 import secrets
 from pathlib import Path
 from typing import Optional
+from datetime import datetime
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
@@ -44,6 +45,14 @@ APPS_CACHE = None
 
 # Lock file for installation
 LOCK_FILE = Path("/tmp/proxmox-api-install.lock")
+
+# Log directory
+LOG_DIR = Path("/var/log/community-scripts")
+
+
+def get_timestamp() -> str:
+    """Get current timestamp in YYYYMMDD-HHMMSS format"""
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 class InstallLock:
@@ -365,6 +374,12 @@ async def _do_install(config: AppConfig) -> InstallResult:
         if not isinstance(ip, str):
             raise HTTPException(status_code=400, detail="Invalid 'ip' option: must be a string")
 
+    # Generate log file path: {timestamp}_{app}_ct{vmid}.log
+    timestamp = get_timestamp()
+    log_filename = f"{timestamp}_{config.app_name}_ct{vmid}.log"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOG_DIR / log_filename
+
     # Build environment variables for script
     env = os.environ.copy()
     env.update({
@@ -383,6 +398,22 @@ async def _do_install(config: AppConfig) -> InstallResult:
         if key.lower() in allowed_keys:
             env[f"CT_{key.upper()}"] = str(value)
 
+    # Write configuration header to log file
+    config_header = f"""# Installation Configuration
+# Timestamp: {timestamp}
+# App: {config.app_name}
+# Container: ct{vmid}
+# CPU: {config.cpu}
+# RAM: {config.ram_mb} MB
+# Disk: {config.disk_gb} GB
+# Bridge: {config.bridge}
+# IP: {ip}/24
+# Gateway: 192.168.1.1
+# DNS: 192.168.1.201
+
+"""
+    log_file.write_text(config_header)
+
     try:
         # Execute the script in thread to avoid blocking event loop
         result = await asyncio.to_thread(
@@ -393,6 +424,11 @@ async def _do_install(config: AppConfig) -> InstallResult:
             text=True,
             timeout=600
         )
+
+        # Append output to log file
+        log_output = result.stdout + "\n" + result.stderr
+        with open(log_file, "a") as f:
+            f.write(log_output)
 
         if result.returncode != 0:
             return InstallResult(
@@ -408,8 +444,12 @@ async def _do_install(config: AppConfig) -> InstallResult:
         )
 
     except subprocess.TimeoutExpired:
+        with open(log_file, "a") as f:
+            f.write("\n# Installation timed out\n")
         return InstallResult(success=False, message="Installation timed out")
     except Exception as e:
+        with open(log_file, "a") as f:
+            f.write(f"\n# Error: {e}\n")
         return InstallResult(success=False, message=str(e))
 
 
