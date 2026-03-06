@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=notify
 User=root
-WorkingDirectory=/opt/repos/proxmox-scripts-gateway
+WorkingDirectory=/opt/proxmox-scripts-gateway
 # === ENVIRONMENT VARIABLES ===
 # Required: API token for authentication (CHANGE THIS!)
 # Generate a secure token: python3 -c "import secrets; print(secrets.token_hex(32))"
@@ -19,8 +19,11 @@ Environment="SCRIPTS_DIR=/opt/pve-helper-scripts"
 Environment="API_HOST=0.0.0.0"
 Environment="API_PORT=8000"
 
+# Optional: Log level (DEBUG, INFO, WARNING, ERROR)
+Environment="LOG_LEVEL=INFO"
+
 # === END ENVIRONMENT VARIABLES ===
-ExecStart=/usr/bin/python3 /opt/repos/proxmox-scripts-gateway/main.py
+ExecStart=/usr/bin/python3 /opt/proxmox-scripts-gateway/src/main.py
 Restart=always
 RestartSec=10
 
