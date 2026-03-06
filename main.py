@@ -9,6 +9,7 @@ import subprocess
 import re
 import fcntl
 import asyncio
+import secrets
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends
@@ -29,13 +30,14 @@ token_header = APIKeyHeader(name="X-API-Token")
 
 
 async def verify_token(token: str = Depends(token_header)):
-    if token != API_TOKEN:
+    # Use constant-time comparison to prevent timing attacks
+    if not secrets.compare_digest(token, API_TOKEN):
         raise HTTPException(status_code=401, detail="Invalid token")
     return token
 
 
-# Path to Proxmox VE Helper-Scripts repository
-SCRIPTS_DIR = Path("/opt/pve-helper-scripts")
+# Path to Proxmox VE Helper-Scripts repository (configurable via env var)
+SCRIPTS_DIR = Path(os.environ.get("SCRIPTS_DIR", "/opt/pve-helper-scripts"))
 
 # Cache for parsed scripts
 APPS_CACHE = None
@@ -98,8 +100,26 @@ class AppConfig(BaseModel):
     def validate_options(cls, v: dict) -> dict:
         """Validate and sanitize user-provided options"""
         allowed_keys = {"vmid", "ip", "ip_base", "template", "ssh_key", "password"}
-        # Filter to only allowed keys
-        return {k: val for k, val in v.items() if k.lower() in allowed_keys}
+        # Filter to only allowed keys and convert vmid to int
+        result = {}
+        for k, val in v.items():
+            if k.lower() not in allowed_keys:
+                continue
+            if k.lower() == "vmid":
+                # Convert vmid to int if possible
+                if val is not None:
+                    if isinstance(val, int):
+                        result[k] = val
+                    elif isinstance(val, str):
+                        try:
+                            result[k] = int(val)
+                        except ValueError:
+                            raise ValueError("'vmid' must be a valid integer")
+                    else:
+                        raise ValueError("'vmid' must be an integer")
+            else:
+                result[k] = val
+        return result
 
 
 class InstallResult(BaseModel):
@@ -214,16 +234,23 @@ def scan_apps() -> list:
     # Handle scripts directory
     if not SCRIPTS_DIR.exists():
         # Clone if not exists
-        subprocess.run(
+        result = subprocess.run(
             ["git", "clone", "https://github.com/community-scripts/ProxmoxVE.git", str(SCRIPTS_DIR)],
-            capture_output=True
+            capture_output=True,
+            text=True
         )
+        if result.returncode != 0:
+            print(f"Git clone failed: {result.stderr}")
+            return []
     else:
         # Pull if exists
-        subprocess.run(
+        result = subprocess.run(
             ["git", "-C", str(SCRIPTS_DIR), "pull"],
-            capture_output=True
+            capture_output=True,
+            text=True
         )
+        if result.returncode != 0:
+            print(f"Git pull failed: {result.stderr}")
 
     ct_scripts = SCRIPTS_DIR / "ct"
     if ct_scripts.exists():
@@ -296,12 +323,17 @@ async def get_app_details(app_name: str, token: str = Depends(verify_token)):
     }
 
 
+def _run_install_with_lock(config: AppConfig) -> InstallResult:
+    """Synchronous installation with lock - runs in thread pool"""
+    with InstallLock():
+        return asyncio.run(_do_install(config))
+
+
 @app.post("/install")
 async def install_app(config: AppConfig, token: str = Depends(verify_token)) -> InstallResult:
     """Install an application with given configuration"""
-    # Acquire lock to prevent concurrent installations
-    with InstallLock():
-        return _do_install(config)
+    # Run entire install (including lock) in thread to avoid blocking event loop
+    return await asyncio.to_thread(_run_install_with_lock, config)
 
 
 async def _do_install(config: AppConfig) -> InstallResult:
