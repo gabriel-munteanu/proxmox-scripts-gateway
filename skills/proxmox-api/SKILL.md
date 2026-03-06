@@ -1,4 +1,4 @@
-# Proxmox API Skill
+# Proxmox Scripts API Skill
 
 This skill provides methods to interact with the Proxmox VE Helper Scripts API.
 
