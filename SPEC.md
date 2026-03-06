@@ -1,4 +1,4 @@
-# Proxmox VE Helper Scripts API
+# Proxmox Scripts API
 
 Auto-install applications from Proxmox VE Helper-Scripts via REST API.
 

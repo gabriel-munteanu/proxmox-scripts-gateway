@@ -1,5 +1,5 @@
 [Unit]
-Description=Proxmox VE Helper Scripts API
+Description=Proxmox Scripts API
 After=network.target
 
 [Service]

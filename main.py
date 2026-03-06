@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title="Proxmox VE API")
+app = FastAPI(title="Proxmox Scripts API")
 
 # Security - require API token, no defaults
 API_TOKEN = os.environ.get("PROXMOX_API_TOKEN")
