@@ -4,6 +4,12 @@ Proxmox VE Helper Scripts API
 Auto-install applications from Proxmox VE Helper-Scripts
 """
 
+import sys
+from pathlib import Path
+
+# Add src directory to path for local modules
+sys.path.insert(0, str(Path(__file__).parent))
+
 import os
 import subprocess
 import re
@@ -16,6 +22,13 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
+
+from build_container import (
+    BuildContainerConfig,
+    create_container,
+    build_config_from_app_config,
+    get_install_script_url,
+)
 
 app = FastAPI(title="Proxmox Scripts API")
 
@@ -479,32 +492,34 @@ def _do_install_sync(config: AppConfig) -> InstallResult:
 """
     log_file.write_text(config_header)
 
-    try:
-        # Execute the script
-        result = subprocess.run(
-            ["bash", app["script_path"]],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=600
-        )
-
-        # Append output to log file
-        log_output = result.stdout + "\n" + result.stderr
+    # Log callback to write to log file
+    def log_callback(msg: str):
         with open(log_file, "a") as f:
-            f.write(log_output)
+            f.write(f"# {msg}\n")
 
-        if result.returncode != 0:
+    try:
+        # Build config for build_container module
+        bc_config = build_config_from_app_config(
+            app_config=config,
+            app_info=app,
+            ctid=vmid,
+            app_name=config.app_name,
+        )
+        
+        # Execute using the new build_container module
+        result = asyncio.run(create_container(bc_config, log_callback=log_callback))
+
+        if not result.get("success"):
             return InstallResult(
                 success=False,
-                message=f"Installation failed: {result.stderr}"
+                message=result.get("message", "Installation failed")
             )
 
         return InstallResult(
             success=True,
-            vmid=vmid,
+            vmid=result.get("ctid", vmid),
             ip=f"{ip}/24",
-            message=f"Application '{config.app_name}' installed successfully"
+            message=result.get("message", f"Application '{config.app_name}' installed successfully")
         )
 
     except subprocess.TimeoutExpired:
