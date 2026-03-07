@@ -368,32 +368,34 @@ def build_config_from_app_config(
     ip = "dhcp"
     gateway = None
     
-    if app_config.ip:
+    # Get IP from options (if provided)
+    ip_option = app_config.options.get("ip") if app_config.options else None
+    if ip_option:
         # Parse IP format: "192.168.1.100/24,gw=192.168.1.1"
-        ip_match = re.match(r"^([^/,]+)", app_config.ip)
+        ip_match = re.match(r"^([^/,]+)", ip_option)
         if ip_match:
             ip = ip_match.group(1)
         
-        gw_match = re.search(r"gw=([^,]+)", app_config.ip)
+        gw_match = re.search(r"gw=([^,]+)", ip_option)
         if gw_match:
             gateway = gw_match.group(1)
     
     return BuildContainerConfig(
         ctid=ctid,
-        hostname=app_config.hostname or app_name,
+        hostname=app_name,  # Use app_name as hostname
         ostype=ostype,
         osversion=osversion,
-        cores=app_config.cpu_cores,
+        cores=app_config.cpu,
         memory=app_config.ram_mb,
         disk_size=app_config.disk_gb,
         bridge=bridge,
         ip=ip,
         gateway=gateway,
-        password=app_config.password,
-        ssh_keys=app_config.ssh_key,
+        password=app_config.options.get("password") if app_config.options else None,
+        ssh_keys=app_config.options.get("ssh_key") if app_config.options else None,
         unprivileged=True,  # Default to unprivileged
-        timezone=app_config.timezone or "UTC",
-        tags=app_config.tags,
+        timezone="UTC",  # Default timezone
+        tags=None,
         app_name=app_name,
         app_install_script=get_install_script_url(app_name),
     )
